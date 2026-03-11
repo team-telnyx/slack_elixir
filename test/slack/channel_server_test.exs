@@ -56,10 +56,11 @@ defmodule Slack.ChannelServerTest do
       assert Enum.sort(state.channels) == ["C1", "C2"]
     end
 
-    test "starts with empty channels on API failure and schedules retry" do
+    test "starts with empty channels when stream returns nothing" do
       Slack.API
       |> expect(:stream, fn "users.conversations", _token, "channels", _opts ->
-        raise "API error"
+        # stream/4 returns empty list on API errors (halts instead of raising)
+        []
       end)
 
       {:ok, pid} = Slack.ChannelServer.start_link({@bot, []})
@@ -67,48 +68,9 @@ defmodule Slack.ChannelServerTest do
       # Give handle_continue time to execute
       Process.sleep(100)
 
-      # GenServer should be alive with empty channels
       assert Process.alive?(pid)
       state = :sys.get_state(pid)
       assert state.channels == []
-    end
-
-    test "retries fetch after failure and succeeds" do
-      test_pid = self()
-
-      Slack.API
-      # First call fails
-      |> expect(:stream, fn "users.conversations", _token, "channels", _opts ->
-        send(test_pid, :first_call)
-        raise "API error"
-      end)
-      # Second call (retry) succeeds
-      |> expect(:stream, fn "users.conversations", _token, "channels", _opts ->
-        send(test_pid, :second_call)
-        [%{"id" => "C1"}]
-      end)
-
-      Slack.MessageServer
-      |> expect(:start_supervised, fn _bot, "C1" ->
-        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
-      end)
-
-      {:ok, pid} = Slack.ChannelServer.start_link({@bot, []})
-
-      # Wait for first call
-      assert_receive :first_call, 1_000
-
-      # Trigger retry immediately (instead of waiting 30s)
-      send(pid, :retry_fetch)
-
-      # Wait for second call
-      assert_receive :second_call, 1_000
-
-      # Give handle_continue time to process
-      Process.sleep(100)
-
-      state = :sys.get_state(pid)
-      assert state.channels == ["C1"]
     end
   end
 

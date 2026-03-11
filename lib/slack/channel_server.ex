@@ -10,7 +10,6 @@ defmodule Slack.ChannelServer do
   # For type options, see: https://api.slack.com/methods/users.conversations
   @default_channel_types "public_channel"
 
-  @retry_interval_ms :timer.seconds(30)
 
   # ----------------------------------------------------------------------------
   # Public API
@@ -59,28 +58,18 @@ defmodule Slack.ChannelServer do
 
   @impl true
   def handle_continue(:fetch_channels, state) do
-    case fetch_channels(state.bot.token, state.channel_types) do
-      {:ok, channels} ->
-        Logger.info(
-          "[Slack.ChannelServer] #{state.bot.module} joining #{length(channels)} channels"
-        )
+    channels = fetch_channels(state.bot.token, state.channel_types)
 
-        Enum.each(channels, fn channel_id ->
-          Logger.debug("[Slack.ChannelServer] #{state.bot.module} joining #{channel_id}")
-          Slack.MessageServer.start_supervised(state.bot, channel_id)
-        end)
+    Logger.info(
+      "[Slack.ChannelServer] #{state.bot.module} joining #{length(channels)} channels"
+    )
 
-        {:noreply, %{state | channels: channels}}
+    Enum.each(channels, fn channel_id ->
+      Logger.debug("[Slack.ChannelServer] #{state.bot.module} joining #{channel_id}")
+      Slack.MessageServer.start_supervised(state.bot, channel_id)
+    end)
 
-      {:error, reason} ->
-        Logger.error(
-          "[Slack.ChannelServer] Failed to fetch channels: #{inspect(reason)}. " <>
-            "Starting with empty channel list, retrying in #{div(@retry_interval_ms, 1000)}s."
-        )
-
-        Process.send_after(self(), :retry_fetch, @retry_interval_ms)
-        {:noreply, state}
-    end
+    {:noreply, %{state | channels: channels}}
   end
 
   @impl true
@@ -96,10 +85,6 @@ defmodule Slack.ChannelServer do
     {:noreply, Map.update!(state, :channels, &List.delete(&1, channel))}
   end
 
-  @impl true
-  def handle_info(:retry_fetch, state) do
-    {:noreply, state, {:continue, :fetch_channels}}
-  end
 
   # ----------------------------------------------------------------------------
   # Private
@@ -110,17 +95,8 @@ defmodule Slack.ChannelServer do
   end
 
   defp fetch_channels(token, types) when is_binary(types) do
-    channels =
-      "users.conversations"
-      |> Slack.API.stream(token, "channels", types: types, exclude_archived: true)
-      |> Enum.map(& &1["id"])
-
-    {:ok, channels}
-  rescue
-    # Safety net: Stream.resource/3 can raise on network errors, malformed
-    # responses, or unexpected API changes. We catch everything here so the
-    # GenServer stays alive and can schedule a retry instead of crashing.
-    e ->
-      {:error, Exception.message(e)}
+    "users.conversations"
+    |> Slack.API.stream(token, "channels", types: types, exclude_archived: true)
+    |> Enum.map(& &1["id"])
   end
 end
