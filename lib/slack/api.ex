@@ -12,16 +12,16 @@ defmodule Slack.API do
   Req client for Slack API.
 
   Includes automatic retry with jittered backoff for transient errors (429, 5xx).
-  Respects Slack's `Retry-After` header on 429 responses.
+  Respects Slack's `Retry-After` header on 429 responses, adding jitter to
+  avoid thundering-herd problems.
   """
   @spec client(String.t()) :: Req.Request.t()
   def client(token) do
     Req.new(
       base_url: @base_url,
       auth: {:bearer, token},
-      retry: :transient,
-      max_retries: @max_retries,
-      retry_delay: &jittered_backoff/1
+      retry: &retry_with_retry_after/2,
+      max_retries: @max_retries
     )
   end
 
@@ -92,9 +92,6 @@ defmodule Slack.API do
         {"", _, _} ->
           {:halt, nil}
 
-        {nil, _, page} when page > 0 ->
-          {:halt, nil}
-
         {cursor, prev_cursor, _page} when cursor == prev_cursor and cursor != nil ->
           Logger.warning("[Slack.API] Duplicate cursor detected, stopping pagination")
           {:halt, nil}
@@ -127,9 +124,44 @@ defmodule Slack.API do
     )
   end
 
+  # Custom retry function for Req (2-arity: receives request + response/exception).
+  #
+  # On 429 responses: parses the Retry-After header and returns {:delay, ms} with
+  # added jitter. Falls back to jittered exponential backoff when the header is absent.
+  #
+  # On other transient errors (408, 5xx, transport errors): uses jittered exponential
+  # backoff via {:delay, ms}.
+  @doc false
+  def retry_with_retry_after(request, response_or_exception) do
+    retry_count = Req.Request.get_private(request, :req_retry_count, 0)
+
+    case response_or_exception do
+      %Req.Response{status: 429} = response ->
+        delay =
+          case Req.Response.get_retry_after(response) do
+            ms when is_integer(ms) and ms > 0 -> ms + jitter()
+            _ -> jittered_backoff(retry_count)
+          end
+
+        {:delay, delay}
+
+      %Req.Response{status: status} when status in [408, 500, 502, 503, 504] ->
+        {:delay, jittered_backoff(retry_count)}
+
+      %Req.TransportError{reason: reason}
+      when reason in [:timeout, :econnrefused, :closed] ->
+        {:delay, jittered_backoff(retry_count)}
+
+      _ ->
+        false
+    end
+  end
+
   # Exponential backoff with jitter: base * 2^n + random(0..1000)ms
   defp jittered_backoff(retry_count) do
     base = Integer.pow(2, retry_count) * 1_000
-    base + :rand.uniform(1_000)
+    base + jitter()
   end
+
+  defp jitter, do: :rand.uniform(1_000)
 end

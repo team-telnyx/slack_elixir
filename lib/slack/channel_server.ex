@@ -62,11 +62,11 @@ defmodule Slack.ChannelServer do
     case fetch_channels(state.bot.token, state.channel_types) do
       {:ok, channels} ->
         Logger.info(
-          "[Slack.ChannelServer] #{state.bot.module} fetched #{length(channels)} channels"
+          "[Slack.ChannelServer] #{state.bot.module} joining #{length(channels)} channels"
         )
 
         Enum.each(channels, fn channel_id ->
-          Logger.info("[Slack.ChannelServer] #{state.bot.module} joining #{channel_id}...")
+          Logger.debug("[Slack.ChannelServer] #{state.bot.module} joining #{channel_id}")
           Slack.MessageServer.start_supervised(state.bot, channel_id)
         end)
 
@@ -117,6 +117,9 @@ defmodule Slack.ChannelServer do
 
     {:ok, channels}
   rescue
+    # Safety net: Stream.resource/3 can raise on network errors, malformed
+    # responses, or unexpected API changes. We catch everything here so the
+    # GenServer stays alive and can schedule a retry instead of crashing.
     e ->
       {:error, Exception.message(e)}
   end

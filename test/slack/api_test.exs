@@ -7,6 +7,24 @@ defmodule Slack.APITest do
   setup :set_mimic_global
 
   describe "stream/4 pagination" do
+    test "returns empty list for empty workspace (first page empty with no cursor)" do
+      Slack.API
+      |> expect(:get, fn "test.list", @token, %{types: "public_channel"} ->
+        {:ok,
+         %{
+           "channels" => [],
+           "response_metadata" => %{"next_cursor" => ""}
+         }}
+      end)
+
+      result =
+        "test.list"
+        |> Slack.API.stream(@token, "channels", types: "public_channel")
+        |> Enum.to_list()
+
+      assert result == []
+    end
+
     test "halts on empty cursor" do
       Slack.API
       |> expect(:get, fn "test.list", @token, %{types: "public_channel"} ->
@@ -206,9 +224,9 @@ defmodule Slack.APITest do
   end
 
   describe "client/1" do
-    test "configures retry with transient mode" do
+    test "configures custom retry function" do
       client = Slack.API.client(@token)
-      assert client.options.retry == :transient
+      assert is_function(client.options.retry, 2)
     end
 
     test "configures max_retries" do
@@ -216,22 +234,70 @@ defmodule Slack.APITest do
       assert client.options.max_retries == 3
     end
 
-    test "configures jittered retry_delay" do
+    test "does not set retry_delay (handled by custom retry function)" do
       client = Slack.API.client(@token)
-      delay_fun = client.options.retry_delay
-      assert is_function(delay_fun, 1)
+      refute Map.has_key?(client.options, :retry_delay)
+    end
+  end
 
+  describe "retry_with_retry_after/2" do
+    test "respects Retry-After header on 429 with jitter" do
+      request = %Req.Request{options: %{}}
+
+      response = %Req.Response{
+        status: 429,
+        headers: %{"retry-after" => ["30"]}
+      }
+
+      assert {:delay, delay} = Slack.API.retry_with_retry_after(request, response)
+      # 30s = 30_000ms + jitter (1..1000ms)
+      assert delay >= 30_001 and delay <= 31_000
+    end
+
+    test "falls back to jittered backoff on 429 without Retry-After" do
+      request = Req.Request.put_private(%Req.Request{options: %{}}, :req_retry_count, 0)
+
+      response = %Req.Response{
+        status: 429,
+        headers: %{}
+      }
+
+      assert {:delay, delay} = Slack.API.retry_with_retry_after(request, response)
       # Retry 0: base 1000 + jitter(1..1000)
-      delay_0 = delay_fun.(0)
-      assert delay_0 >= 1_001 and delay_0 <= 2_000
+      assert delay >= 1_001 and delay <= 2_000
+    end
 
+    test "retries on 500 with jittered backoff" do
+      request = Req.Request.put_private(%Req.Request{options: %{}}, :req_retry_count, 1)
+
+      response = %Req.Response{status: 500, headers: [], body: ""}
+
+      assert {:delay, delay} = Slack.API.retry_with_retry_after(request, response)
       # Retry 1: base 2000 + jitter(1..1000)
-      delay_1 = delay_fun.(1)
-      assert delay_1 >= 2_001 and delay_1 <= 3_000
+      assert delay >= 2_001 and delay <= 3_000
+    end
 
-      # Retry 2: base 4000 + jitter(1..1000)
-      delay_2 = delay_fun.(2)
-      assert delay_2 >= 4_001 and delay_2 <= 5_000
+    test "retries on transport errors" do
+      request = Req.Request.put_private(%Req.Request{options: %{}}, :req_retry_count, 0)
+
+      error = %Req.TransportError{reason: :timeout}
+
+      assert {:delay, delay} = Slack.API.retry_with_retry_after(request, error)
+      assert delay >= 1_001 and delay <= 2_000
+    end
+
+    test "does not retry on non-transient responses" do
+      request = %Req.Request{options: %{}}
+      response = %Req.Response{status: 401, headers: [], body: ""}
+
+      assert Slack.API.retry_with_retry_after(request, response) == false
+    end
+
+    test "does not retry on non-transient exceptions" do
+      request = %Req.Request{options: %{}}
+      error = %RuntimeError{message: "boom"}
+
+      assert Slack.API.retry_with_retry_after(request, error) == false
     end
   end
 end
