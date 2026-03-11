@@ -4,11 +4,13 @@ defmodule Slack.ChannelServer do
 
   require Logger
 
-  # By default the bot will join all conversations that it has access to.
-  # For type options, see: [api](https://api.slack.com/methods/users.conversations).
-  # Note, these require the following scopes:
-  #   `channels:read`, `groups:read`, `im:read`, `mpim:read`
-  @default_channel_types "public_channel,private_channel,mpim,im"
+  # Default to public_channel only — requires just `channels:read` scope.
+  # Users who need private channels, IMs, or MPIMs can opt in via config:
+  #   channels: [types: "public_channel,private_channel,mpim,im"]
+  # For type options, see: https://api.slack.com/methods/users.conversations
+  @default_channel_types "public_channel"
+
+  @retry_interval_ms :timer.seconds(30)
 
   # ----------------------------------------------------------------------------
   # Public API
@@ -25,9 +27,11 @@ defmodule Slack.ChannelServer do
         types when is_list(types) -> Enum.join(types, ",")
       end
 
-    channels = fetch_channels(bot.token, channel_types)
-
-    GenServer.start_link(__MODULE__, {bot, channels}, name: via_tuple(bot))
+    GenServer.start_link(
+      __MODULE__,
+      {bot, channel_types},
+      name: via_tuple(bot)
+    )
   end
 
   def join(bot, channel) do
@@ -43,19 +47,40 @@ defmodule Slack.ChannelServer do
   # ----------------------------------------------------------------------------
 
   @impl true
-  def init({bot, channels}) do
+  def init({bot, channel_types}) do
     state = %{
       bot: bot,
-      channels: channels
+      channels: [],
+      channel_types: channel_types
     }
 
-    {:ok, state, {:continue, :join}}
+    {:ok, state, {:continue, :fetch_channels}}
   end
 
   @impl true
-  def handle_continue(:join, state) do
-    Enum.each(state.channels, &join(state.bot, &1))
-    {:noreply, state}
+  def handle_continue(:fetch_channels, state) do
+    case fetch_channels(state.bot.token, state.channel_types) do
+      {:ok, channels} ->
+        Logger.info(
+          "[Slack.ChannelServer] #{state.bot.module} fetched #{length(channels)} channels"
+        )
+
+        Enum.each(channels, fn channel_id ->
+          Logger.info("[Slack.ChannelServer] #{state.bot.module} joining #{channel_id}...")
+          Slack.MessageServer.start_supervised(state.bot, channel_id)
+        end)
+
+        {:noreply, %{state | channels: channels}}
+
+      {:error, reason} ->
+        Logger.error(
+          "[Slack.ChannelServer] Failed to fetch channels: #{inspect(reason)}. " <>
+            "Starting with empty channel list, retrying in #{div(@retry_interval_ms, 1000)}s."
+        )
+
+        Process.send_after(self(), :retry_fetch, @retry_interval_ms)
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -71,13 +96,28 @@ defmodule Slack.ChannelServer do
     {:noreply, Map.update!(state, :channels, &List.delete(&1, channel))}
   end
 
+  @impl true
+  def handle_info(:retry_fetch, state) do
+    {:noreply, state, {:continue, :fetch_channels}}
+  end
+
+  # ----------------------------------------------------------------------------
+  # Private
+  # ----------------------------------------------------------------------------
+
   defp via_tuple(%Slack.Bot{module: bot}) do
     {:via, Registry, {Slack.ChannelServerRegistry, bot}}
   end
 
   defp fetch_channels(token, types) when is_binary(types) do
-    "users.conversations"
-    |> Slack.API.stream(token, "channels", types: types)
-    |> Enum.map(& &1["id"])
+    channels =
+      "users.conversations"
+      |> Slack.API.stream(token, "channels", types: types, exclude_archived: true)
+      |> Enum.map(& &1["id"])
+
+    {:ok, channels}
+  rescue
+    e ->
+      {:error, Exception.message(e)}
   end
 end

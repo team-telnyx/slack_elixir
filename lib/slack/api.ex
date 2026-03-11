@@ -6,13 +6,23 @@ defmodule Slack.API do
   require Logger
 
   @base_url "https://slack.com/api"
+  @max_retries 3
 
   @doc """
   Req client for Slack API.
+
+  Includes automatic retry with jittered backoff for transient errors (429, 5xx).
+  Respects Slack's `Retry-After` header on 429 responses.
   """
   @spec client(String.t()) :: Req.Request.t()
   def client(token) do
-    Req.new(base_url: @base_url, auth: {:bearer, token})
+    Req.new(
+      base_url: @base_url,
+      auth: {:bearer, token},
+      retry: :transient,
+      max_retries: @max_retries,
+      retry_delay: &jittered_backoff/1
+    )
   end
 
   @doc """
@@ -60,41 +70,66 @@ defmodule Slack.API do
   @doc """
   GET pages from Slack API as a `Stream`.
 
-  You can start at a cursor if you pass in `:next_cursor` as one of the `args`.
-  Note that it is assumed to be an atom key. If you use a string key you'll
-  end up with `next_cursor` parameter twice.
+  Paginates using cursor-based pagination. The stream halts when:
+  - The cursor is empty (`""`) or `nil`
+  - A duplicate cursor is detected (Slack returned the same cursor twice)
+  - An empty page is returned after data has been fetched
+  - An API error occurs (returns partial data collected so far instead of raising)
+
+  You can start at a cursor if you pass in `:cursor` as one of the `args`.
   """
   @spec stream(String.t(), String.t(), String.t(), map() | keyword()) :: Enumerable.t()
   def stream(endpoint, token, resource, args \\ %{}) do
     {starting_cursor, args} =
       args
       |> Map.new()
-      |> Map.pop(:next_cursor, nil)
+      |> Map.pop(:cursor, nil)
 
+    # Accumulator: {current_cursor, previous_cursor, pages_fetched}
     Stream.resource(
-      # start_fun
-      fn -> starting_cursor end,
-
-      # next_fun
+      fn -> {starting_cursor, nil, 0} end,
       fn
-        "" ->
+        {"", _, _} ->
           {:halt, nil}
 
-        cursor ->
-          case get(endpoint, token, Map.merge(args, %{next_cursor: cursor})) do
-            {:ok, %{"ok" => true, ^resource => data} = body} ->
-              cursor = get_in(body, ["response_metadata", "next_cursor"]) || ""
-              {data, cursor}
+        {nil, _, page} when page > 0 ->
+          {:halt, nil}
 
-            {_, error} ->
-              raise "Error fetching #{resource}: #{inspect(error)}"
+        {cursor, prev_cursor, _page} when cursor == prev_cursor and cursor != nil ->
+          Logger.warning("[Slack.API] Duplicate cursor detected, stopping pagination")
+          {:halt, nil}
+
+        {cursor, _prev_cursor, page_count} ->
+          params = if cursor, do: Map.put(args, :cursor, cursor), else: args
+
+          case __MODULE__.get(endpoint, token, params) do
+            {:ok, %{^resource => data} = body} ->
+              next = get_in(body, ["response_metadata", "next_cursor"]) || ""
+
+              case data do
+                [] when page_count > 0 ->
+                  Logger.warning(
+                    "[Slack.API] Empty page with cursor, stopping pagination"
+                  )
+
+                  {:halt, nil}
+
+                _ ->
+                  {data, {next, cursor, page_count + 1}}
+              end
+
+            {:error, reason} ->
+              Logger.error("[Slack.API] Pagination error: #{inspect(reason)}")
+              {:halt, nil}
           end
       end,
-
-      # end_fun
-      fn acc ->
-        acc
-      end
+      fn _ -> :ok end
     )
+  end
+
+  # Exponential backoff with jitter: base * 2^n + random(0..1000)ms
+  defp jittered_backoff(retry_count) do
+    base = Integer.pow(2, retry_count) * 1_000
+    base + :rand.uniform(1_000)
   end
 end
